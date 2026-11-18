@@ -49,7 +49,7 @@ val downloadWebLibs by tasks.registering {
             val f = File(outDir, name)
             if (!f.exists() || f.length() == 0L) {
                 logger.lifecycle("Downloading $url")
-                java.net.URL(url).openStream().use { input ->
+                uri(url).toURL().openStream().use { input ->
                     f.outputStream().use { output -> input.copyTo(output) }
                 }
             }
