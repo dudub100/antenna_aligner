@@ -148,6 +148,9 @@
                         <input type="text" id="setJsonPath" autocomplete="off" autocapitalize="off"></label>
                     <label class="field full"><span>RSL column name (used first if the reply lists columns)</span>
                         <input type="text" id="setRslColumn" autocomplete="off" autocapitalize="off"></label>
+                    <label class="field full"><span>RSL delay compensation (ms)</span>
+                        <input type="number" id="setRslDelay" step="50"></label>
+                    <p class="hint full">Pairs each RSL reading with the angle from this long before it arrived. Sweep both ways and raise it until the forward and return traces overlap.</p>
                     <label class="field"><span>Poll interval (ms)</span>
                         <input type="number" id="setPollMs" min="100" step="100"></label>
                     <div class="field" style="justify-content:flex-end;">
@@ -173,6 +176,14 @@
                 <div class="slider-row">
                     <label for="fovInput">Lens FOV°</label>
                     <input type="number" id="fovInput" min="10" max="130" step="0.5" style="flex:1;">
+                </div>
+                <div class="slider-row">
+                    <label for="resSelect">Resolution</label>
+                    <select id="resSelect" style="flex:1; padding:6px;">
+                        <option value="640">640 px (fastest)</option>
+                        <option value="960">960 px</option>
+                        <option value="1280">1280 px (most precise)</option>
+                    </select>
                 </div>
                 <div class="hint">Wide edge field of view of the selected lens. Calibrate: turn the phone slowly and adjust until Optical matches Sensors azimuth. Saved per camera.</div>
                 <div class="slider-row" id="zoomContainer" style="display:none;">
@@ -313,8 +324,19 @@
         fillSettingsForm();
         if (!hasBridge) $('settingsPanel').querySelector('summary').innerText += ' (browser mode: uses /api/rsl proxy)';
 
+        function lsGet(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch (e) { return d; } }
+        function lsSet(k, v) { try { localStorage.setItem(k, String(v)); } catch (e) {} }
+        let rslDelayMs = parseFloat(lsGet('rslDelayMs', '0')) || 0;
+        $('setRslDelay').value = rslDelayMs;
+        $('setRslDelay').addEventListener('change', () => {
+            rslDelayMs = Math.max(0, parseFloat($('setRslDelay').value) || 0);
+            $('setRslDelay').value = rslDelayMs;
+            lsSet('rslDelayMs', rslDelayMs);
+        });
+
         $('saveSettingsBtn').addEventListener('click', () => {
             readSettingsForm();
+            $('setRslDelay').dispatchEvent(new Event('change'));
             const b = $('saveSettingsBtn');
             b.innerText = 'Saved';
             setTimeout(() => b.innerText = 'Save', 1000);
@@ -501,6 +523,8 @@
         // --- ZERO LOGIC ---
         zeroBtn.addEventListener('click', () => {
             optAzimuth = 0; optElevation = 0;
+            resetTracking = true;   // new reference keyframe at 0°/0°
+            angleHistory.length = 0;
             optAzimuthVal.innerText = "0.0°"; optElevationVal.innerText = "0.0°";
             overlayOpt.innerText = "Az: 0.0° | El: 0.0°";
             sensAzimuthOffset = rawSensAzimuth; sensElevationOffset = rawSensElevation;
@@ -588,8 +612,18 @@
             let v = parseFloat(fovInput.value);
             if (isNaN(v) || v < 5 || v > 170) { fovInput.value = baseLongEdgeFOV; return; }
             baseLongEdgeFOV = v;
+            resetTracking = true;
             fovDisplay.innerText = `Base: ~${baseLongEdgeFOV}°`;
             try { if (currentDeviceId) localStorage.setItem('fov:' + currentDeviceId, String(v)); } catch (e) {}
+        });
+
+        const resSelect = $('resSelect');
+        let camWidth = parseInt(lsGet('camWidth', '640')) || 640;
+        resSelect.value = String(camWidth);
+        resSelect.addEventListener('change', () => {
+            camWidth = parseInt(resSelect.value) || 640;
+            lsSet('camWidth', camWidth);
+            if (currentDeviceId) startCamera(currentDeviceId);
         });
 
         function startCamera(deviceId) {
@@ -625,7 +659,7 @@
             for (let attempt = 0; attempt < 3 && !stream; attempt++) {
                 try {
                     const vc = attempt < 2
-                        ? { deviceId: { exact: deviceId }, width: { ideal: 640 } }
+                        ? { deviceId: { exact: deviceId }, width: { ideal: camWidth } }
                         : { deviceId: { exact: deviceId } };
                     stream = await navigator.mediaDevices.getUserMedia({ video: vc, audio: false });
                 } catch (e) {
@@ -695,64 +729,179 @@
             lastFrameTime = performance.now();
         });
 
-        // --- OPENCV PROCESSING LOGIC (RANSAC + ROI) ---
+        // --- OPENCV PROCESSING: KEYFRAME-REFERENCED TRACKING ---
+        // Each frame is measured directly against a fixed reference frame (keyframe), not
+        // against the previous frame. Errors therefore do not accumulate: pointing back at the
+        // same spot gives the same angle. Keyframes are kept in a small map with their angles,
+        // so returning to an area re-uses the same keyframe (repeatable, no drift).
         let lastVideoTime = -1;
         let lastFrameTime = 0;
         let lastRestartTime = 0;
-        // Count frames actually delivered by the camera (more reliable stall detection)
         let rvfcCount = 0, lastRvfcCount = 0;
         if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
             const onFrame = () => { rvfcCount++; video.requestVideoFrameCallback(onFrame); };
             video.requestVideoFrameCallback(onFrame);
         }
 
+        // Angle history, used to match each RSL reading with the angle at the time it was measured
+        const angleHistory = [];
+        function recordAngle() {
+            angleHistory.push({ t: performance.now(), az: optAzimuth, el: optElevation });
+            if (angleHistory.length > 600) angleHistory.shift();
+        }
+        function angleAt(t) {
+            const n = angleHistory.length;
+            if (n === 0) return { az: optAzimuth, el: optElevation };
+            if (t <= angleHistory[0].t) return angleHistory[0];
+            if (t >= angleHistory[n - 1].t) return angleHistory[n - 1];
+            let lo = 0, hi = n - 1;
+            while (hi - lo > 1) { const mid = (lo + hi) >> 1; if (angleHistory[mid].t <= t) lo = mid; else hi = mid; }
+            const A = angleHistory[lo], B = angleHistory[hi];
+            const f = (t - A.t) / ((B.t - A.t) || 1);
+            return { az: A.az + (B.az - A.az) * f, el: A.el + (B.el - A.el) * f };
+        }
+
+        function median(arr) {
+            const a = arr.slice().sort((x, y) => x - y);
+            const m = a.length >> 1;
+            return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
+        }
+
         function startProcessing() {
-            // Own capture canvas, resized whenever the camera resolution changes
-            // (cv.VideoCapture fixes its size at creation, which breaks after a lens switch)
             const capCanvas = document.createElement('canvas');
             const capCtx = capCanvas.getContext('2d', { willReadFrequently: true });
 
             let w = 0, h = 0;
-            let oldFrame = null, newFrame = null;
-            let oldGray = new cv.Mat(), newGray = new cv.Mat();
-            let p0 = new cv.Mat(), p1 = new cv.Mat(), st = new cv.Mat(), err = new cv.Mat();
-            let maxCorners = 100, qualityLevel = 0.3, minDistance = 7, blockSize = 7;
-            let winSize = new cv.Size(15, 15), maxLevel = 2;
-            let criteria = new cv.TermCriteria(cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_COUNT, 10, 0.03);
-            let colorGreen = new cv.Scalar(0, 255, 0, 255);
-            let colorRed = new cv.Scalar(255, 0, 0, 255);
-            let colorBlue = new cv.Scalar(0, 150, 255, 255);
+            let frame = null;
+            let gray = new cv.Mat();
+            let st = new cv.Mat(), err = new cv.Mat();
+            const winSize = new cv.Size(21, 21), maxLevel = 3;
+            const criteria = new cv.TermCriteria(cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_COUNT, 30, 0.01);
+            const USE_INITIAL_FLOW = (typeof cv.OPTFLOW_USE_INITIAL_FLOW === 'number') ? cv.OPTFLOW_USE_INITIAL_FLOW : 4;
+            const colorGreen = new cv.Scalar(0, 255, 0, 255);
+            const colorRed = new cv.Scalar(255, 0, 0, 255);
+            const colorBlue = new cv.Scalar(0, 150, 255, 255);
             const FPS = 30;
+            const MAX_KEYS = 30;
+            const MIN_INLIERS = 12;
             let consecutiveErrors = 0;
+
+            let keyframes = [];   // { gray, pts, n, az, el, guess: Float32Array }
+            let key = null;       // current reference
+
+            function freeKey(k) { try { k.gray.delete(); k.pts.delete(); } catch (e) {} }
+            function clearMap() { keyframes.forEach(freeKey); keyframes = []; key = null; }
 
             function ensureSize() {
                 const vw = video.videoWidth, vh = video.videoHeight;
-                if (vw === w && vh === h && oldFrame) return;
+                if (vw === w && vh === h && frame) return;
                 w = vw; h = vh;
                 capCanvas.width = w; capCanvas.height = h;
                 canvas.width = w; canvas.height = h;
-                if (oldFrame) oldFrame.delete();
-                if (newFrame) newFrame.delete();
-                oldFrame = new cv.Mat(h, w, cv.CV_8UC4);
-                newFrame = new cv.Mat(h, w, cv.CV_8UC4);
+                if (frame) frame.delete();
+                frame = new cv.Mat(h, w, cv.CV_8UC4);
                 resetTracking = true;
             }
 
-            function grab(mat) {
+            function grab() {
                 capCtx.drawImage(video, 0, 0, w, h);
-                mat.data.set(capCtx.getImageData(0, 0, w, h).data);
+                frame.data.set(capCtx.getImageData(0, 0, w, h).data);
+                cv.cvtColor(frame, gray, cv.COLOR_RGBA2GRAY);
             }
 
-            function reseed() {
-                p0.delete();
-                p0 = new cv.Mat();
-                grab(oldFrame);
-                cv.cvtColor(oldFrame, oldGray, cv.COLOR_RGBA2GRAY);
-                resetTracking = false;
+            function focalPx() {
+                const zs = $('zoomSlider');
+                const zoom = parseFloat(zs ? zs.value : 1) || 1;
+                return ((Math.max(w, h) / 2) / Math.tan((baseLongEdgeFOV / 2) * Math.PI / 180)) * zoom;
+            }
+
+            function makeKeyframe(maskMat) {
+                const pts = new cv.Mat();
+                cv.goodFeaturesToTrack(gray, pts, 150, 0.02, 10, maskMat, 7);
+                if (pts.rows < MIN_INLIERS) { pts.delete(); return null; }
+                if (typeof cv.cornerSubPix === 'function') {
+                    try {
+                        cv.cornerSubPix(gray, pts, new cv.Size(5, 5), new cv.Size(-1, -1),
+                            new cv.TermCriteria(cv.TERM_CRITERIA_EPS | cv.TERM_CRITERIA_COUNT, 20, 0.03));
+                    } catch (e) {}
+                }
+                const k = { gray: gray.clone(), pts, n: pts.rows, az: optAzimuth, el: optElevation,
+                            guess: Float32Array.from(pts.data32F) };
+                keyframes.push(k);
+                if (keyframes.length > MAX_KEYS) {
+                    // Evict the stored keyframe farthest from where we are now
+                    let far = -1, farD = -1;
+                    keyframes.forEach((c, i) => {
+                        if (c === k) return;
+                        const d = Math.hypot(c.az - optAzimuth, c.el - optElevation);
+                        if (d > farD) { farD = d; far = i; }
+                    });
+                    if (far >= 0) { freeKey(keyframes[far]); keyframes.splice(far, 1); }
+                }
+                return k;
+            }
+
+            // Measure the current frame against keyframe k, starting from a guess of where its points are now.
+            function measure(k, guess, tmp) {
+                const next = cv.matFromArray(k.n, 1, cv.CV_32FC2, Array.from(guess)); tmp.push(next);
+                cv.calcOpticalFlowPyrLK(k.gray, gray, k.pts, next, st, err, winSize, maxLevel, criteria, USE_INITIAL_FLOW, 1e-4);
+
+                const f = focalPx(), cx = w / 2, cy = h / 2, rad = 180 / Math.PI;
+                const src = [], dst = [], idx = [];
+                for (let i = 0; i < k.n; i++) {
+                    if (st.data[i] !== 1) continue;
+                    const nx = next.data32F[i * 2], ny = next.data32F[i * 2 + 1];
+                    if (!isFinite(nx) || !isFinite(ny) || nx < 0 || ny < 0 || nx >= w || ny >= h) continue;
+                    src.push(k.pts.data32F[i * 2], k.pts.data32F[i * 2 + 1]);
+                    dst.push(nx, ny);
+                    idx.push(i);
+                }
+                const n = idx.length;
+                if (n < MIN_INLIERS) return null;
+
+                let inl = new Array(n).fill(1);
+                const srcMat = cv.matFromArray(n, 1, cv.CV_32FC2, src); tmp.push(srcMat);
+                const dstMat = cv.matFromArray(n, 1, cv.CV_32FC2, dst); tmp.push(dstMat);
+                const rmask = new cv.Mat(); tmp.push(rmask);
+                try {
+                    const H = cv.findHomography(srcMat, dstMat, cv.RANSAC, 2.0, rmask); tmp.push(H);
+                    if (!H.empty() && rmask.rows === n) inl = Array.from(rmask.data.slice(0, n));
+                } catch (e) { /* degenerate: keep all points, median handles outliers */ }
+
+                // Per-point angular shift (exact for rotation, unlike a plain pixel average), then median
+                const dAz = [], dEl = [];
+                for (let j = 0; j < n; j++) {
+                    if (!inl[j]) continue;
+                    const kx = src[j * 2], ky = src[j * 2 + 1], nx = dst[j * 2], ny = dst[j * 2 + 1];
+                    dAz.push((Math.atan((kx - cx) / f) - Math.atan((nx - cx) / f)) * rad);
+                    dEl.push((Math.atan((ny - cy) / f) - Math.atan((ky - cy) / f)) * rad);
+                }
+                if (dAz.length < MIN_INLIERS) return null;
+                const mAz = median(dAz), mEl = median(dEl);
+
+                // New guesses: tracked points where available, predicted shift elsewhere
+                const g = Float32Array.from(guess);
+                const pxShiftX = -Math.tan(mAz / rad) * f, pxShiftY = Math.tan(mEl / rad) * f;
+                for (let i = 0; i < k.n; i++) {
+                    g[i * 2] = k.pts.data32F[i * 2] + pxShiftX;
+                    g[i * 2 + 1] = k.pts.data32F[i * 2 + 1] + pxShiftY;
+                }
+                for (let j = 0; j < n; j++) if (inl[j]) { g[idx[j] * 2] = dst[j * 2]; g[idx[j] * 2 + 1] = dst[j * 2 + 1]; }
+
+                return { az: k.az + mAz, el: k.el + mEl, inliers: dAz.length, shiftX: pxShiftX, shiftY: pxShiftY,
+                         guess: g, dst, inl };
+            }
+
+            function predictedGuess(k) {
+                const f = focalPx(), rad = 180 / Math.PI;
+                const sx = -Math.tan((optAzimuth - k.az) / rad) * f, sy = Math.tan((optElevation - k.el) / rad) * f;
+                const g = new Float32Array(k.n * 2);
+                for (let i = 0; i < k.n; i++) { g[i * 2] = k.pts.data32F[i * 2] + sx; g[i * 2 + 1] = k.pts.data32F[i * 2 + 1] + sy; }
+                return g;
             }
 
             function processVideo() {
-                const tmp = [];   // per-frame Mats, always freed in finally
+                const tmp = [];
                 try {
                     if (isCameraSwitching || video.readyState < 2 || !video.videoWidth) return;
 
@@ -771,17 +920,18 @@
                     }
 
                     ensureSize();
+                    if (resetTracking) { clearMap(); resetTracking = false; }
 
-                    // ROI mask
-                    let roiRect = null;
-                    let maskMat;
+                    grab();
+
+                    // ROI mask (where new keyframe features are picked)
+                    let roiRect = null, maskMat;
                     if (roiToggle.checked) {
                         maskMat = cv.Mat.zeros(h, w, cv.CV_8UC1);
-                        let sizePct = parseInt(roiSizeSlider.value) / 100.0;
-                        let rw = Math.floor(w * sizePct), rh = Math.floor(h * sizePct);
-                        let rx = Math.floor((w - rw) / 2), ry = Math.floor((h - rh) / 2);
-                        roiRect = new cv.Rect(rx, ry, rw, rh);
-                        let roi = maskMat.roi(roiRect);
+                        const p = parseInt(roiSizeSlider.value) / 100.0;
+                        const rw = Math.floor(w * p), rh = Math.floor(h * p);
+                        roiRect = new cv.Rect(Math.floor((w - rw) / 2), Math.floor((h - rh) / 2), rw, rh);
+                        const roi = maskMat.roi(roiRect);
                         roi.setTo(new cv.Scalar(255));
                         roi.delete();
                     } else {
@@ -789,114 +939,70 @@
                     }
                     tmp.push(maskMat);
 
-                    if (resetTracking) reseed();
+                    if (!key) key = makeKeyframe(maskMat);
 
-                    grab(newFrame);
-                    cv.cvtColor(newFrame, newGray, cv.COLOR_RGBA2GRAY);
+                    let m = key ? measure(key, key.guess, tmp) : null;
+                    const maxShift = 0.3 * Math.min(w, h);
+                    const needSwitch = !m || m.inliers < MIN_INLIERS * 2
+                        || Math.abs(m.shiftX) > maxShift || Math.abs(m.shiftY) > maxShift;
 
+                    if (m) { optAzimuth = m.az; optElevation = m.el; key.guess = m.guess; }
+
+                    if (needSwitch) {
+                        // 1) Try stored keyframes near the current angle (repeatable re-use)
+                        const f = focalPx(), rad = 180 / Math.PI;
+                        const limitDeg = Math.atan(maxShift / f) * rad * 0.8;
+                        const cands = keyframes
+                            .filter(c => c !== key)
+                            .map(c => ({ c, d: Math.hypot(c.az - optAzimuth, c.el - optElevation) }))
+                            .filter(o => o.d < limitDeg)
+                            .sort((p, q) => p.d - q.d)
+                            .slice(0, 3);
+                        let switched = false;
+                        for (const { c } of cands) {
+                            const m2 = measure(c, predictedGuess(c), tmp);
+                            if (m2 && m2.inliers >= MIN_INLIERS * 2) {
+                                key = c; key.guess = m2.guess; m = m2;
+                                optAzimuth = m2.az; optElevation = m2.el;
+                                switched = true;
+                                break;
+                            }
+                        }
+                        // 2) Otherwise start a new keyframe here
+                        if (!switched) {
+                            const nk = makeKeyframe(maskMat);
+                            if (nk) { key = nk; m = null; }
+                        }
+                    }
+
+                    // Draw
                     if (roiRect) {
-                        cv.rectangle(newFrame, new cv.Point(roiRect.x, roiRect.y),
+                        cv.rectangle(frame, new cv.Point(roiRect.x, roiRect.y),
                             new cv.Point(roiRect.x + roiRect.width, roiRect.y + roiRect.height), colorBlue, 2);
                     }
-
-                    if (p0.rows < 20) {
-                        cv.goodFeaturesToTrack(oldGray, p0, maxCorners, qualityLevel, minDistance, maskMat, blockSize);
-                    }
-
-                    let goodNewPts = [];
-                    if (p0.rows > 0) {
-                        cv.calcOpticalFlowPyrLK(oldGray, newGray, p0, p1, st, err, winSize, maxLevel, criteria);
-
-                        let rawSrc = [], rawDst = [];
-                        for (let i = 0; i < st.rows; i++) {
-                            if (st.data[i] === 1) {
-                                const ox = p0.data32F[i * 2], oy = p0.data32F[i * 2 + 1];
-                                const nx = p1.data32F[i * 2], ny = p1.data32F[i * 2 + 1];
-                                // Drop NaN / off-frame points
-                                if (isFinite(nx) && isFinite(ny) && nx >= 0 && ny >= 0 && nx < w && ny < h) {
-                                    rawSrc.push(ox, oy);
-                                    rawDst.push(nx, ny);
-                                }
-                            }
-                        }
-
-                        let dxSum = 0, dySum = 0, inlierCount = 0;
-                        let numPoints = rawSrc.length / 2;
-
-                        if (numPoints >= 4) {
-                            let srcMat = cv.matFromArray(numPoints, 1, cv.CV_32FC2, rawSrc); tmp.push(srcMat);
-                            let dstMat = cv.matFromArray(numPoints, 1, cv.CV_32FC2, rawDst); tmp.push(dstMat);
-                            let ransacMask = new cv.Mat(); tmp.push(ransacMask);
-                            let H = null;
-                            try {
-                                H = cv.findHomography(srcMat, dstMat, cv.RANSAC, 3.0, ransacMask);
-                                tmp.push(H);
-                            } catch (e) {
-                                H = null;   // degenerate point set: treat as no motion this frame
-                            }
-                            const ok = H && !H.empty() && ransacMask.rows === numPoints;
-                            for (let i = 0; i < numPoints; i++) {
-                                let oldX = rawSrc[i * 2], oldY = rawSrc[i * 2 + 1];
-                                let newX = rawDst[i * 2], newY = rawDst[i * 2 + 1];
-                                if (ok && ransacMask.data[i] === 1) {
-                                    goodNewPts.push(newX, newY);
-                                    dxSum += (oldX - newX); dySum += (newY - oldY);
-                                    inlierCount++;
-                                    cv.circle(newFrame, new cv.Point(newX, newY), 3, colorGreen, -1);
-                                } else {
-                                    cv.circle(newFrame, new cv.Point(newX, newY), 4, colorRed, 2);
-                                }
-                            }
-                        } else {
-                            for (let i = 0; i < numPoints; i++) {
-                                let oldX = rawSrc[i * 2], oldY = rawSrc[i * 2 + 1];
-                                let newX = rawDst[i * 2], newY = rawDst[i * 2 + 1];
-                                goodNewPts.push(newX, newY);
-                                dxSum += (oldX - newX); dySum += (newY - oldY);
-                                inlierCount++;
-                                cv.circle(newFrame, new cv.Point(newX, newY), 3, colorGreen, -1);
-                            }
-                        }
-
-                        if (inlierCount > 0) {
-                            let avgPxShiftX = dxSum / inlierCount;
-                            let avgPxShiftY = dySum / inlierCount;
-                            let zoomSlider = $('zoomSlider');
-                            let currentZoom = parseFloat(zoomSlider ? zoomSlider.value : 1.0) || 1.0;
-                            let maxDimension = Math.max(w, h);
-                            let f_px = ((maxDimension / 2) / Math.tan((baseLongEdgeFOV / 2) * (Math.PI / 180))) * currentZoom;
-                            let degPerPixel = (180 / Math.PI) / f_px;
-                            let dAz = avgPxShiftX * degPerPixel, dEl = avgPxShiftY * degPerPixel;
-                            // Ignore impossible jumps (bad frame), keep tracking
-                            if (isFinite(dAz) && isFinite(dEl) && Math.abs(dAz) < 15 && Math.abs(dEl) < 15) {
-                                optAzimuth += dAz;
-                                optElevation += dEl;
-                                optAzimuthVal.innerText = optAzimuth.toFixed(1) + "°";
-                                optElevationVal.innerText = optElevation.toFixed(1) + "°";
-                                overlayOpt.innerText = `Az: ${optAzimuth.toFixed(1)}° | El: ${optElevation.toFixed(1)}°`;
-                            }
+                    if (m) {
+                        for (let j = 0; j < m.dst.length / 2; j++) {
+                            const pt = new cv.Point(m.dst[j * 2], m.dst[j * 2 + 1]);
+                            if (m.inl[j]) cv.circle(frame, pt, 3, colorGreen, -1);
+                            else cv.circle(frame, pt, 4, colorRed, 2);
                         }
                     }
+                    cv.imshow('canvasOutput', frame);
 
-                    // Carry surviving points to the next frame
-                    p0.delete();
-                    p0 = goodNewPts.length
-                        ? cv.matFromArray(goodNewPts.length / 2, 1, cv.CV_32FC2, goodNewPts)
-                        : new cv.Mat();
-
-                    cv.imshow('canvasOutput', newFrame);
-                    newGray.copyTo(oldGray);
+                    optAzimuthVal.innerText = optAzimuth.toFixed(2) + "°";
+                    optElevationVal.innerText = optElevation.toFixed(2) + "°";
+                    overlayOpt.innerText = `Az: ${optAzimuth.toFixed(2)}° | El: ${optElevation.toFixed(2)}° | KF ${keyframes.length}`;
+                    recordAngle();
                     consecutiveErrors = 0;
                 } catch (e) {
                     console.error(e);
-                    // Never get stuck re-processing the same bad state: start fresh next frame
                     resetTracking = true;
                     if (++consecutiveErrors > 30) {
                         consecutiveErrors = 0;
                         restartCamera('Tracking error, restarting camera…');
                     }
                 } finally {
-                    for (const m of tmp) { try { if (m && !m.isDeleted()) m.delete(); } catch (e) {} }
+                    for (const mm of tmp) { try { if (mm && !mm.isDeleted()) mm.delete(); } catch (e) {} }
                     setTimeout(processVideo, 1000 / FPS);
                 }
             }
@@ -994,6 +1100,7 @@
         async function pollOnce() {
             let rslValue = NaN;
             let isAz = chartAxisSelect.value === 'azimuth';
+            let measAngle = { az: optAzimuth, el: optElevation };
 
             if (!rslToggle.checked) {
                 let dist = Math.abs(isAz ? optAzimuth : optElevation);
@@ -1002,7 +1109,10 @@
                 rslValueEl.style.color = "#f39c12";
             } else {
                 try {
+                    const tSend = performance.now();
                     rslValue = (await readRsl()).value;
+                    const tRecv = performance.now();
+                    measAngle = angleAt((tSend + tRecv) / 2 - rslDelayMs);
                     rslValueEl.innerText = rslValue.toFixed(1) + " dBm";
                     rslValueEl.style.color = "#2ecc71";
                 } catch (err) {
@@ -1014,12 +1124,12 @@
             overlayRsl.innerText = isNaN(rslValue) ? '--' : rslValue.toFixed(1) + ' dBm';
 
             if (!isNaN(rslValue)) {
-                traceDataAz.push({ x: optAzimuth, y: rslValue });
-                traceDataEl.push({ x: optElevation, y: rslValue });
+                traceDataAz.push({ x: measAngle.az, y: rslValue });
+                traceDataEl.push({ x: measAngle.el, y: rslValue });
                 if (traceDataAz.length > 300) traceDataAz.shift();
                 if (traceDataEl.length > 300) traceDataEl.shift();
                 rslChart.data.datasets[0].data = isAz ? [...traceDataAz] : [...traceDataEl];
-                rslChart.data.datasets[1].data = [{ x: isAz ? optAzimuth : optElevation, y: rslValue }];
+                rslChart.data.datasets[1].data = [{ x: isAz ? measAngle.az : measAngle.el, y: rslValue }];
                 rslChart.data.datasets[2].data = centroidLineData();
                 rslChart.update();
             }
