@@ -150,7 +150,7 @@
                         <input type="text" id="setRslColumn" autocomplete="off" autocapitalize="off"></label>
                     <label class="field full"><span>RSL delay compensation (ms)</span>
                         <input type="number" id="setRslDelay" step="50"></label>
-                    <p class="hint full">Pairs each RSL reading with the angle from this long before it arrived. Sweep both ways and raise it until the forward and return traces overlap.</p>
+                    <p class="hint full">Shifts each RSL reading in time relative to the camera angle. Can be negative. Easiest: sweep both ways across the peak, then tap “Auto delay” under the graph.</p>
                     <label class="field"><span>Poll interval (ms)</span>
                         <input type="number" id="setPollMs" min="100" step="100"></label>
                     <div class="field" style="justify-content:flex-end;">
@@ -238,9 +238,11 @@
                     <div style="position: relative; height: 220px; width: 100%;">
                         <canvas id="rslChart"></canvas>
                     </div>
+                    <div class="hint"><span style="color:#3498db;">●</span> increasing angle &nbsp; <span style="color:#e67e22;">●</span> decreasing angle &nbsp; <span style="color:#888;">●</span> still</div>
                     <div class="hint" id="centroidInfo"></div>
                     <div style="display: flex; gap: 10px;">
                         <button id="calcCentroidBtn" style="font-size: 0.8rem; padding: 8px; flex: 1;">Calc Centroid</button>
+                        <button id="autoDelayBtn" style="font-size: 0.8rem; padding: 8px; flex: 1; background:#8e44ad;">Auto delay</button>
                         <button id="clearChartBtn" style="font-size: 0.8rem; padding: 8px; background: #555; flex: 1;">Clear Trace</button>
                     </div>
                 </div>
@@ -329,7 +331,8 @@
         let rslDelayMs = parseFloat(lsGet('rslDelayMs', '0')) || 0;
         $('setRslDelay').value = rslDelayMs;
         $('setRslDelay').addEventListener('change', () => {
-            rslDelayMs = Math.max(0, parseFloat($('setRslDelay').value) || 0);
+            rslDelayMs = Math.max(-3000, Math.min(3000, parseFloat($('setRslDelay').value) || 0));
+            if (typeof rebuildChart === 'function') rebuildChart();
             $('setRslDelay').value = rslDelayMs;
             lsSet('rslDelayMs', rslDelayMs);
         });
@@ -747,7 +750,7 @@
         const angleHistory = [];
         function recordAngle() {
             angleHistory.push({ t: performance.now(), az: optAzimuth, el: optElevation });
-            if (angleHistory.length > 600) angleHistory.shift();
+            if (angleHistory.length > 6000) angleHistory.shift();
         }
         function angleAt(t) {
             const n = angleHistory.length;
@@ -1010,18 +1013,27 @@
         }
 
         // --- CHART SETUP ---
-        let traceDataAz = [];
-        let traceDataEl = [];
+        // Every RSL reading is stored with the time it was measured. Its angle is looked up
+        // from the camera's angle history using the current delay setting, so changing the
+        // delay re-pairs ALL past points. Points are split by sweep direction.
+        let samples = [];               // { t, rsl }
+        const MAX_SAMPLES = 600;
         let chartAxisSelect = $('chartAxisSelect');
         let clearChartBtn = $('clearChartBtn');
+        let dirCentroids = null;        // { up, down } when both directions exist
+
+        const DIR_SPEED_MIN = 0.05;     // deg/s below which a point counts as "still"
 
         let rslChart = new Chart($('rslChart').getContext('2d'), {
             type: 'scatter',
             data: {
                 datasets: [
-                    { label: 'Trace', data: [], backgroundColor: 'rgba(52, 152, 219, 0.3)', borderColor: 'rgba(52, 152, 219, 0.8)', showLine: true, pointRadius: 2, borderWidth: 1.5 },
+                    { label: 'Increasing', data: [], backgroundColor: 'rgba(52,152,219,0.7)', borderColor: 'rgba(52,152,219,0.7)', pointRadius: 2.5 },
+                    { label: 'Decreasing', data: [], backgroundColor: 'rgba(230,126,34,0.7)', borderColor: 'rgba(230,126,34,0.7)', pointRadius: 2.5 },
+                    { label: 'Still', data: [], backgroundColor: 'rgba(136,136,136,0.5)', borderColor: 'rgba(136,136,136,0.5)', pointRadius: 2 },
                     { label: 'Current Point', data: [], backgroundColor: '#e74c3c', borderColor: '#fff', pointRadius: 7, borderWidth: 2 },
-                    { label: 'Centroid Line', data: [], borderColor: '#e74c3c', borderDash: [5, 5], borderWidth: 2, showLine: true, pointRadius: 0 }
+                    { label: 'Centroid', data: [], borderColor: '#e74c3c', borderDash: [5, 5], borderWidth: 2, showLine: true, pointRadius: 0 },
+                    { label: 'Dir centroids', data: [], borderColor: 'rgba(255,255,255,0.35)', borderDash: [2, 4], borderWidth: 1, showLine: true, pointRadius: 0, spanGaps: false }
                 ]
             },
             options: {
@@ -1029,7 +1041,6 @@
                 maintainAspectRatio: false,
                 animation: false,
                 scales: {
-                    // suggested* = default range, but expands automatically if real data goes outside it
                     x: { type: 'linear', position: 'bottom', suggestedMin: -5, suggestedMax: 5,
                          title: { display: true, text: 'Azimuth (°)', color: '#aaa' }, ticks: { color: '#888' }, grid: { color: '#333' } },
                     y: { type: 'linear', suggestedMin: -80, suggestedMax: -10,
@@ -1039,57 +1050,120 @@
             }
         });
 
-        function centroidLineData() {
-            if (lockedCentroidX === null) return [];
-            let ys = rslChart.data.datasets[0].data.map(p => p.y);
-            let lo = Math.min(-80, ...ys) - 2, hi = Math.max(-10, ...ys) + 2;
-            return [{ x: lockedCentroidX, y: lo }, { x: lockedCentroidX, y: hi }];
+        function axisKey() { return chartAxisSelect.value === 'azimuth' ? 'az' : 'el'; }
+
+        // Angle + sweep direction for a sample, for a given delay
+        function sampleAt(t, delay, key) {
+            const tm = t - delay;
+            const a = angleAt(tm);
+            const v = (angleAt(tm + 100)[key] - angleAt(tm - 100)[key]) / 0.2; // deg/s
+            const dir = v > DIR_SPEED_MIN ? 1 : (v < -DIR_SPEED_MIN ? -1 : 0);
+            return { x: a[key], dir };
+        }
+
+        function pointsFor(delay, key) {
+            return samples.map(s => { const p = sampleAt(s.t, delay, key); return { x: p.x, y: s.rsl, dir: p.dir }; });
+        }
+
+        function yRange() {
+            let lo = -80, hi = -10;
+            for (const s of samples) { lo = Math.min(lo, s.rsl); hi = Math.max(hi, s.rsl); }
+            return [lo - 2, hi + 2];
+        }
+        function vline(x) { const [lo, hi] = yRange(); return [{ x, y: lo }, { x, y: hi }]; }
+
+        function rebuildChart(current) {
+            const key = axisKey();
+            const pts = pointsFor(rslDelayMs, key);
+            rslChart.data.datasets[0].data = pts.filter(p => p.dir > 0);
+            rslChart.data.datasets[1].data = pts.filter(p => p.dir < 0);
+            rslChart.data.datasets[2].data = pts.filter(p => p.dir === 0);
+            if (current) rslChart.data.datasets[3].data = [current];
+            rslChart.data.datasets[4].data = lockedCentroidX === null ? [] : vline(lockedCentroidX);
+            rslChart.data.datasets[5].data = dirCentroids
+                ? [...vline(dirCentroids.up), { x: NaN, y: NaN }, ...vline(dirCentroids.down)] : [];
+            rslChart.update();
+        }
+
+        // Power-weighted centroid of the top 15 dB of the main lobe
+        function centroid(pts) {
+            if (pts.length < 3) return null;
+            let maxRsl = -1000;
+            for (const p of pts) if (p.y > maxRsl) maxRsl = p.y;
+            const thr = maxRsl - 15;
+            let sw = 0, sx = 0;
+            for (const p of pts) if (p.y > thr) { const w = Math.pow(10, p.y / 10); sw += w; sx += p.x * w; }
+            return sw > 0 ? { x: sx / sw, peak: maxRsl } : null;
         }
 
         function clearTrace() {
-            traceDataAz = []; traceDataEl = [];
+            samples = [];
             lockedCentroidX = null;
-            rslChart.data.datasets[0].data = [];
-            rslChart.data.datasets[2].data = [];
+            dirCentroids = null;
             $('centroidInfo').innerText = '';
-            rslChart.update();
+            rslChart.data.datasets[3].data = [];
+            rebuildChart();
         }
         clearChartBtn.addEventListener('click', clearTrace);
 
         calcCentroidBtn.addEventListener('click', () => {
-            let isAz = chartAxisSelect.value === 'azimuth';
-            let currentTrace = isAz ? traceDataAz : traceDataEl;
-            if (currentTrace.length === 0) return;
-            let maxRsl = -1000;
-            for (let pt of currentTrace) if (pt.y > maxRsl) maxRsl = pt.y;
-            let threshold = maxRsl - 15; // top 15 dB of the main lobe
-            let sumPower = 0, sumProduct = 0;
-            for (let pt of currentTrace) {
-                if (pt.y > threshold) {
-                    let linPower = Math.pow(10, pt.y / 10);
-                    sumPower += linPower;
-                    sumProduct += (pt.x * linPower);
-                }
-            }
-            if (sumPower > 0) {
-                lockedCentroidX = sumProduct / sumPower;
-                rslChart.data.datasets[2].data = centroidLineData();
+            const key = axisKey();
+            const pts = pointsFor(rslDelayMs, key);
+            const up = centroid(pts.filter(p => p.dir > 0));
+            const down = centroid(pts.filter(p => p.dir < 0));
+            const all = centroid(pts);
+            const name = key === 'az' ? 'azimuth' : 'elevation';
+            if (up && down) {
+                // Midpoint of the two sweep directions cancels timing lag and mechanical backlash
+                lockedCentroidX = (up.x + down.x) / 2;
+                dirCentroids = { up: up.x, down: down.x };
                 $('centroidInfo').innerText =
-                    `Centroid ${isAz ? 'azimuth' : 'elevation'}: ${lockedCentroidX.toFixed(2)}° (peak ${maxRsl.toFixed(1)} dBm)`;
-                rslChart.update();
+                    `Centroid ${name}: ${lockedCentroidX.toFixed(2)}° (midpoint of both directions). ` +
+                    `Increasing ${up.x.toFixed(2)}°, decreasing ${down.x.toFixed(2)}°, gap ${(up.x - down.x).toFixed(2)}°.`;
+            } else if (all) {
+                lockedCentroidX = all.x;
+                dirCentroids = null;
+                $('centroidInfo').innerText =
+                    `Centroid ${name}: ${all.x.toFixed(2)}° (peak ${all.peak.toFixed(1)} dBm). Sweep both ways for a direction-corrected result.`;
             } else {
                 alert("Not enough valid peak data to calculate centroid.");
+                return;
             }
+            rebuildChart();
+        });
+
+        // Find the delay that makes the two sweep directions agree
+        $('autoDelayBtn').addEventListener('click', () => {
+            const key = axisKey();
+            let best = null;
+            for (let d = -2000; d <= 2000; d += 10) {
+                const pts = pointsFor(d, key);
+                const up = centroid(pts.filter(p => p.dir > 0));
+                const down = centroid(pts.filter(p => p.dir < 0));
+                if (!up || !down) continue;
+                const gap = Math.abs(up.x - down.x);
+                if (!best || gap < best.gap) best = { d, gap };
+            }
+            if (!best) {
+                alert('Sweep across the peak in both directions first (several passes), then try again.');
+                return;
+            }
+            rslDelayMs = best.d;
+            $('setRslDelay').value = best.d;
+            lsSet('rslDelayMs', best.d);
+            lockedCentroidX = null; dirCentroids = null;
+            $('centroidInfo').innerText = `Auto delay: ${best.d} ms (remaining gap between directions ${best.gap.toFixed(2)}°). ` +
+                (best.gap > 0.05 ? 'A gap that delay cannot remove is usually mechanical backlash; use Calc Centroid (midpoint).' : '');
+            rebuildChart();
         });
 
         chartAxisSelect.addEventListener('change', (e) => {
-            let isAz = e.target.value === 'azimuth';
+            const isAz = e.target.value === 'azimuth';
             rslChart.options.scales.x.title.text = isAz ? 'Azimuth (°)' : 'Elevation (°)';
-            lockedCentroidX = null;
+            lockedCentroidX = null; dirCentroids = null;
             $('centroidInfo').innerText = '';
-            rslChart.data.datasets[0].data = isAz ? [...traceDataAz] : [...traceDataEl];
-            rslChart.data.datasets[2].data = [];
-            rslChart.update();
+            rslChart.data.datasets[3].data = [];
+            rebuildChart();
         });
 
         // --- RSL POLLING & GRAPH ---
@@ -1099,11 +1173,11 @@
 
         async function pollOnce() {
             let rslValue = NaN;
-            let isAz = chartAxisSelect.value === 'azimuth';
-            let measAngle = { az: optAzimuth, el: optElevation };
+            let tMeas = performance.now();
+            const key = axisKey();
 
             if (!rslToggle.checked) {
-                let dist = Math.abs(isAz ? optAzimuth : optElevation);
+                const dist = Math.abs(key === 'az' ? optAzimuth : optElevation);
                 rslValue = Math.max(-80, -35 - (dist * 4));
                 rslValueEl.innerText = rslValue.toFixed(1) + " dBm (Simulated)";
                 rslValueEl.style.color = "#f39c12";
@@ -1112,7 +1186,7 @@
                     const tSend = performance.now();
                     rslValue = (await readRsl()).value;
                     const tRecv = performance.now();
-                    measAngle = angleAt((tSend + tRecv) / 2 - rslDelayMs);
+                    tMeas = (tSend + tRecv) / 2;
                     rslValueEl.innerText = rslValue.toFixed(1) + " dBm";
                     rslValueEl.style.color = "#2ecc71";
                 } catch (err) {
@@ -1124,14 +1198,10 @@
             overlayRsl.innerText = isNaN(rslValue) ? '--' : rslValue.toFixed(1) + ' dBm';
 
             if (!isNaN(rslValue)) {
-                traceDataAz.push({ x: measAngle.az, y: rslValue });
-                traceDataEl.push({ x: measAngle.el, y: rslValue });
-                if (traceDataAz.length > 300) traceDataAz.shift();
-                if (traceDataEl.length > 300) traceDataEl.shift();
-                rslChart.data.datasets[0].data = isAz ? [...traceDataAz] : [...traceDataEl];
-                rslChart.data.datasets[1].data = [{ x: isAz ? measAngle.az : measAngle.el, y: rslValue }];
-                rslChart.data.datasets[2].data = centroidLineData();
-                rslChart.update();
+                samples.push({ t: tMeas, rsl: rslValue });
+                if (samples.length > MAX_SAMPLES) samples.shift();
+                const p = sampleAt(tMeas, rslDelayMs, key);
+                rebuildChart({ x: p.x, y: rslValue });
             }
         }
 
