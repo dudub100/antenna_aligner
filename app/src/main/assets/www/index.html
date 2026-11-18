@@ -166,7 +166,15 @@
             </details>
 
             <div class="hw-controls">
-                <select id="cameraSelect"></select>
+                <div style="display:flex; gap:8px;">
+                    <select id="cameraSelect" style="flex:1;"></select>
+                    <button id="restartCamBtn" title="Restart camera" style="flex:0 0 auto; padding:8px 14px; background:#555;">↻</button>
+                </div>
+                <div class="slider-row">
+                    <label for="fovInput">Lens FOV°</label>
+                    <input type="number" id="fovInput" min="10" max="130" step="0.5" style="flex:1;">
+                </div>
+                <div class="hint">Wide edge field of view of the selected lens. Calibrate: turn the phone slowly and adjust until Optical matches Sensors azimuth. Saved per camera.</div>
                 <div class="slider-row" id="zoomContainer" style="display:none;">
                     <label for="zoomSlider">Zoom</label>
                     <input type="range" id="zoomSlider" min="1" max="10" step="0.1" value="1">
@@ -517,9 +525,18 @@
             }
         }
 
-        // --- CAMERA LOGIC ---
+        const sleep = ms => new Promise(r => setTimeout(r, ms));
+        function showStatus(msg) { statusDiv.style.display = 'block'; statusDiv.innerText = msg; }
+        function hideStatus() { statusDiv.style.display = 'none'; }
+
+        // --- CAMERA LOGIC (serialized switching, retries, auto-recovery) ---
+        let camGen = 0;                 // increments on every camera (re)start
+        let camChain = Promise.resolve(); // camera starts run one at a time
+        let currentDeviceId = null;
+        const fovInput = $('fovInput');
+
         function onOpenCvReady() {
-            statusDiv.innerText = "Requesting camera permissions...";
+            showStatus("Requesting camera permissions...");
             getCameras();
         }
 
@@ -528,7 +545,7 @@
                 let initialStream = await navigator.mediaDevices.getUserMedia({ video: true });
                 initialStream.getTracks().forEach(t => t.stop());
             } catch (err) {
-                statusDiv.innerText = "Camera permission denied.";
+                showStatus("Camera permission denied.");
                 return;
             }
             try {
@@ -541,73 +558,163 @@
                     option.text = device.label || `Camera ${index + 1}`;
                     cameraSelect.appendChild(option);
                 });
-                cameraSelect.onchange = () => { startCamera(cameraSelect.value); };
+                cameraSelect.onchange = () => startCamera(cameraSelect.value);
                 if (allVideoDevices.length > 0) {
                     let backCamera = allVideoDevices.find(d => d.label.toLowerCase().includes('back'));
                     let defaultDevice = backCamera || allVideoDevices[0];
                     cameraSelect.value = defaultDevice.deviceId;
                     startCamera(defaultDevice.deviceId);
                 }
-            } catch (err) { statusDiv.innerText = "Error: " + err; }
+            } catch (err) { showStatus("Error: " + err); }
         }
 
-        async function startCamera(deviceId) {
-            isCameraSwitching = true;
-            if (currentStream) currentStream.getTracks().forEach(t => t.stop());
-            let selectedDevice = allVideoDevices.find(d => d.deviceId === deviceId);
-            let label = selectedDevice ? selectedDevice.label.toLowerCase() : "";
-            if (label.includes("ultra")) baseLongEdgeFOV = 110.0;
-            else if (label.includes("tele")) baseLongEdgeFOV = 30.0;
-            else baseLongEdgeFOV = 65.0;
+        $('restartCamBtn').addEventListener('click', () => {
+            if (currentDeviceId) startCamera(currentDeviceId);
+        });
+
+        function guessFov(label) {
+            if (label.includes("ultra")) return 110.0;
+            if (label.includes("tele")) return 30.0;
+            return 65.0;
+        }
+        function loadFov(deviceId, label) {
+            let saved = NaN;
+            try { saved = parseFloat(localStorage.getItem('fov:' + deviceId)); } catch (e) {}
+            baseLongEdgeFOV = isNaN(saved) ? guessFov(label) : saved;
+            fovInput.value = baseLongEdgeFOV;
             fovDisplay.innerText = `Base: ~${baseLongEdgeFOV}°`;
-            try {
-                currentStream = await navigator.mediaDevices.getUserMedia({
-                    video: { deviceId: { exact: deviceId }, width: { ideal: 640 } }, audio: false
-                });
-                video.srcObject = currentStream;
-                video.play();
-                videoTrack = currentStream.getVideoTracks()[0];
-                requestWakeLock();
-
-                let zoomContainer = $('zoomContainer');
-                let zoomSlider = $('zoomSlider');
-                try {
-                    let capabilities = videoTrack.getCapabilities();
-                    let settings = videoTrack.getSettings();
-                    if (capabilities && 'zoom' in capabilities) {
-                        zoomSlider.min = capabilities.zoom.min;
-                        zoomSlider.max = capabilities.zoom.max;
-                        zoomSlider.step = capabilities.zoom.step;
-                        zoomSlider.value = settings.zoom || 1;
-                        zoomContainer.style.display = 'flex';
-                        zoomSlider.oninput = async (e) => {
-                            try { await videoTrack.applyConstraints({ advanced: [{ zoom: parseFloat(e.target.value) }] }); } catch (err) {}
-                        };
-                    } else zoomContainer.style.display = 'none';
-                } catch (e) { zoomContainer.style.display = 'none'; }
-
-                statusDiv.style.display = "none";
-                video.onloadeddata = () => {
-                    video.width = video.videoWidth; video.height = video.videoHeight;
-                    canvas.width = video.videoWidth; canvas.height = video.videoHeight;
-                    resetTracking = true;
-                    isCameraSwitching = false;
-                    if (!trackingStarted) { startProcessing(); trackingStarted = true; }
-                };
-            } catch (err) {
-                console.error("Camera Switch Error:", err);
-                isCameraSwitching = false;
-            }
         }
+        fovInput.addEventListener('change', () => {
+            let v = parseFloat(fovInput.value);
+            if (isNaN(v) || v < 5 || v > 170) { fovInput.value = baseLongEdgeFOV; return; }
+            baseLongEdgeFOV = v;
+            fovDisplay.innerText = `Base: ~${baseLongEdgeFOV}°`;
+            try { if (currentDeviceId) localStorage.setItem('fov:' + currentDeviceId, String(v)); } catch (e) {}
+        });
+
+        function startCamera(deviceId) {
+            camChain = camChain.then(() => doStartCamera(deviceId)).catch(e => console.error(e));
+            return camChain;
+        }
+
+        function restartCamera(reason) {
+            if (isCameraSwitching || !currentDeviceId) return;
+            console.warn('Restarting camera:', reason);
+            showStatus(reason);
+            startCamera(currentDeviceId);
+        }
+
+        async function doStartCamera(deviceId) {
+            isCameraSwitching = true;
+            const myGen = ++camGen;
+            currentDeviceId = deviceId;
+
+            // Fully release the previous camera before opening the next (Samsung needs this)
+            if (currentStream) {
+                currentStream.getTracks().forEach(t => { t.onended = null; t.stop(); });
+                currentStream = null;
+            }
+            video.srcObject = null;
+            await sleep(300);
+
+            let selectedDevice = allVideoDevices.find(d => d.deviceId === deviceId);
+            loadFov(deviceId, selectedDevice ? selectedDevice.label.toLowerCase() : "");
+
+            // Open with retries; fall back to no resolution hint on the last try
+            let stream = null, lastErr = null;
+            for (let attempt = 0; attempt < 3 && !stream; attempt++) {
+                try {
+                    const vc = attempt < 2
+                        ? { deviceId: { exact: deviceId }, width: { ideal: 640 } }
+                        : { deviceId: { exact: deviceId } };
+                    stream = await navigator.mediaDevices.getUserMedia({ video: vc, audio: false });
+                } catch (e) {
+                    lastErr = e;
+                    await sleep(500 * (attempt + 1));
+                }
+            }
+            if (myGen !== camGen) { if (stream) stream.getTracks().forEach(t => t.stop()); return; }
+            if (!stream) {
+                showStatus("Could not open camera: " + (lastErr ? lastErr.message : 'unknown') + ". Tap ↻ to retry.");
+                isCameraSwitching = false;
+                return;
+            }
+
+            currentStream = stream;
+            videoTrack = stream.getVideoTracks()[0];
+            videoTrack.onended = () => { if (myGen === camGen) restartCamera('Camera stopped, restarting…'); };
+
+            video.srcObject = stream;
+            try { await video.play(); } catch (e) {}
+
+            // Wait until real frames are flowing (don't rely on the loadeddata event)
+            const t0 = performance.now();
+            while ((video.readyState < 2 || !video.videoWidth) && performance.now() - t0 < 4000) await sleep(50);
+            if (!video.videoWidth) {
+                showStatus("Camera opened but no video. Tap ↻ to retry.");
+                isCameraSwitching = false;
+                return;
+            }
+
+            setupZoom();
+            requestWakeLock();
+            resetTracking = true;     // re-seed features, keep accumulated angles
+            lastVideoTime = -1;
+            lastFrameTime = performance.now();
+            hideStatus();
+            isCameraSwitching = false;
+
+            if (!trackingStarted) { trackingStarted = true; startProcessing(); }
+        }
+
+        function setupZoom() {
+            let zoomContainer = $('zoomContainer');
+            let zoomSlider = $('zoomSlider');
+            zoomSlider.value = 1;
+            try {
+                let capabilities = videoTrack.getCapabilities ? videoTrack.getCapabilities() : null;
+                let settings = videoTrack.getSettings();
+                if (capabilities && 'zoom' in capabilities) {
+                    zoomSlider.min = capabilities.zoom.min;
+                    zoomSlider.max = capabilities.zoom.max;
+                    zoomSlider.step = capabilities.zoom.step || 0.1;
+                    zoomSlider.value = settings.zoom || 1;
+                    zoomContainer.style.display = 'flex';
+                    zoomSlider.oninput = async (e) => {
+                        resetTracking = true;
+                        try { await videoTrack.applyConstraints({ advanced: [{ zoom: parseFloat(e.target.value) }] }); } catch (err) {}
+                    };
+                } else zoomContainer.style.display = 'none';
+            } catch (e) { zoomContainer.style.display = 'none'; }
+        }
+
+        // When returning to the app, recover a camera Android took away
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState !== 'visible') return;
+            if (!videoTrack || videoTrack.readyState === 'ended') restartCamera('Resuming camera…');
+            lastFrameTime = performance.now();
+        });
 
         // --- OPENCV PROCESSING LOGIC (RANSAC + ROI) ---
+        let lastVideoTime = -1;
+        let lastFrameTime = 0;
+        let lastRestartTime = 0;
+        // Count frames actually delivered by the camera (more reliable stall detection)
+        let rvfcCount = 0, lastRvfcCount = 0;
+        if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+            const onFrame = () => { rvfcCount++; video.requestVideoFrameCallback(onFrame); };
+            video.requestVideoFrameCallback(onFrame);
+        }
+
         function startProcessing() {
-            let cap = new cv.VideoCapture(video);
-            let w = video.width, h = video.height;
-            let oldFrame = new cv.Mat(h, w, cv.CV_8UC4);
-            let oldGray = new cv.Mat();
-            let newFrame = new cv.Mat(h, w, cv.CV_8UC4);
-            let newGray = new cv.Mat();
+            // Own capture canvas, resized whenever the camera resolution changes
+            // (cv.VideoCapture fixes its size at creation, which breaks after a lens switch)
+            const capCanvas = document.createElement('canvas');
+            const capCtx = capCanvas.getContext('2d', { willReadFrequently: true });
+
+            let w = 0, h = 0;
+            let oldFrame = null, newFrame = null;
+            let oldGray = new cv.Mat(), newGray = new cv.Mat();
             let p0 = new cv.Mat(), p1 = new cv.Mat(), st = new cv.Mat(), err = new cv.Mat();
             let maxCorners = 100, qualityLevel = 0.3, minDistance = 7, blockSize = 7;
             let winSize = new cv.Size(15, 15), maxLevel = 2;
@@ -616,28 +723,59 @@
             let colorRed = new cv.Scalar(255, 0, 0, 255);
             let colorBlue = new cv.Scalar(0, 150, 255, 255);
             const FPS = 30;
+            let consecutiveErrors = 0;
+
+            function ensureSize() {
+                const vw = video.videoWidth, vh = video.videoHeight;
+                if (vw === w && vh === h && oldFrame) return;
+                w = vw; h = vh;
+                capCanvas.width = w; capCanvas.height = h;
+                canvas.width = w; canvas.height = h;
+                if (oldFrame) oldFrame.delete();
+                if (newFrame) newFrame.delete();
+                oldFrame = new cv.Mat(h, w, cv.CV_8UC4);
+                newFrame = new cv.Mat(h, w, cv.CV_8UC4);
+                resetTracking = true;
+            }
+
+            function grab(mat) {
+                capCtx.drawImage(video, 0, 0, w, h);
+                mat.data.set(capCtx.getImageData(0, 0, w, h).data);
+            }
+
+            function reseed() {
+                p0.delete();
+                p0 = new cv.Mat();
+                grab(oldFrame);
+                cv.cvtColor(oldFrame, oldGray, cv.COLOR_RGBA2GRAY);
+                resetTracking = false;
+            }
 
             function processVideo() {
+                const tmp = [];   // per-frame Mats, always freed in finally
                 try {
-                    if (isCameraSwitching || video.readyState < 2 || !video.videoWidth) {
-                        setTimeout(processVideo, 100);
+                    if (isCameraSwitching || video.readyState < 2 || !video.videoWidth) return;
+
+                    // Watchdog: restart the camera if frames stop arriving
+                    const now = performance.now();
+                    if (video.currentTime !== lastVideoTime || rvfcCount !== lastRvfcCount) {
+                        lastVideoTime = video.currentTime;
+                        lastRvfcCount = rvfcCount;
+                        lastFrameTime = now;
+                    } else if (now - lastFrameTime > 3000 && now - lastRestartTime > 10000
+                               && document.visibilityState === 'visible') {
+                        lastFrameTime = now;
+                        lastRestartTime = now;
+                        restartCamera('Camera stalled, restarting…');
                         return;
                     }
-                    if (newFrame.cols !== video.videoWidth || newFrame.rows !== video.videoHeight) {
-                        video.width = video.videoWidth; video.height = video.videoHeight;
-                        canvas.width = video.videoWidth; canvas.height = video.videoHeight;
-                        w = video.width; h = video.height;
-                        oldFrame.delete(); newFrame.delete(); oldGray.delete(); newGray.delete();
-                        oldFrame = new cv.Mat(h, w, cv.CV_8UC4);
-                        newFrame = new cv.Mat(h, w, cv.CV_8UC4);
-                        oldGray = new cv.Mat(); newGray = new cv.Mat();
-                        resetTracking = true;
-                    }
 
-                    let maskMat = new cv.Mat();
+                    ensureSize();
+
+                    // ROI mask
                     let roiRect = null;
+                    let maskMat;
                     if (roiToggle.checked) {
-                        maskMat.delete();
                         maskMat = cv.Mat.zeros(h, w, cv.CV_8UC1);
                         let sizePct = parseInt(roiSizeSlider.value) / 100.0;
                         let rw = Math.floor(w * sizePct), rh = Math.floor(h * sizePct);
@@ -646,53 +784,62 @@
                         let roi = maskMat.roi(roiRect);
                         roi.setTo(new cv.Scalar(255));
                         roi.delete();
+                    } else {
+                        maskMat = new cv.Mat();
                     }
+                    tmp.push(maskMat);
 
-                    if (resetTracking) {
-                        if (p0 != null) { try { p0.delete(); } catch (e) {} }
-                        p0 = new cv.Mat();
-                        optAzimuth = 0; optElevation = 0;
-                        optAzimuthVal.innerText = "0.0°"; optElevationVal.innerText = "0.0°";
-                        cap.read(oldFrame);
-                        cv.cvtColor(oldFrame, oldGray, cv.COLOR_RGBA2GRAY);
-                        resetTracking = false;
-                    }
+                    if (resetTracking) reseed();
 
-                    cap.read(newFrame);
+                    grab(newFrame);
                     cv.cvtColor(newFrame, newGray, cv.COLOR_RGBA2GRAY);
 
-                    if (roiToggle.checked && roiRect) {
-                        let pt1 = new cv.Point(roiRect.x, roiRect.y);
-                        let pt2 = new cv.Point(roiRect.x + roiRect.width, roiRect.y + roiRect.height);
-                        cv.rectangle(newFrame, pt1, pt2, colorBlue, 2);
+                    if (roiRect) {
+                        cv.rectangle(newFrame, new cv.Point(roiRect.x, roiRect.y),
+                            new cv.Point(roiRect.x + roiRect.width, roiRect.y + roiRect.height), colorBlue, 2);
                     }
 
                     if (p0.rows < 20) {
                         cv.goodFeaturesToTrack(oldGray, p0, maxCorners, qualityLevel, minDistance, maskMat, blockSize);
                     }
 
+                    let goodNewPts = [];
                     if (p0.rows > 0) {
                         cv.calcOpticalFlowPyrLK(oldGray, newGray, p0, p1, st, err, winSize, maxLevel, criteria);
+
                         let rawSrc = [], rawDst = [];
                         for (let i = 0; i < st.rows; i++) {
                             if (st.data[i] === 1) {
-                                rawSrc.push(p0.data32F[i * 2], p0.data32F[i * 2 + 1]);
-                                rawDst.push(p1.data32F[i * 2], p1.data32F[i * 2 + 1]);
+                                const ox = p0.data32F[i * 2], oy = p0.data32F[i * 2 + 1];
+                                const nx = p1.data32F[i * 2], ny = p1.data32F[i * 2 + 1];
+                                // Drop NaN / off-frame points
+                                if (isFinite(nx) && isFinite(ny) && nx >= 0 && ny >= 0 && nx < w && ny < h) {
+                                    rawSrc.push(ox, oy);
+                                    rawDst.push(nx, ny);
+                                }
                             }
                         }
-                        let goodNewPts = [];
+
                         let dxSum = 0, dySum = 0, inlierCount = 0;
                         let numPoints = rawSrc.length / 2;
+
                         if (numPoints >= 4) {
-                            let srcMat = cv.matFromArray(numPoints, 1, cv.CV_32FC2, rawSrc);
-                            let dstMat = cv.matFromArray(numPoints, 1, cv.CV_32FC2, rawDst);
-                            let ransacMask = new cv.Mat();
-                            let H = cv.findHomography(srcMat, dstMat, cv.RANSAC, 3.0, ransacMask);
+                            let srcMat = cv.matFromArray(numPoints, 1, cv.CV_32FC2, rawSrc); tmp.push(srcMat);
+                            let dstMat = cv.matFromArray(numPoints, 1, cv.CV_32FC2, rawDst); tmp.push(dstMat);
+                            let ransacMask = new cv.Mat(); tmp.push(ransacMask);
+                            let H = null;
+                            try {
+                                H = cv.findHomography(srcMat, dstMat, cv.RANSAC, 3.0, ransacMask);
+                                tmp.push(H);
+                            } catch (e) {
+                                H = null;   // degenerate point set: treat as no motion this frame
+                            }
+                            const ok = H && !H.empty() && ransacMask.rows === numPoints;
                             for (let i = 0; i < numPoints; i++) {
                                 let oldX = rawSrc[i * 2], oldY = rawSrc[i * 2 + 1];
                                 let newX = rawDst[i * 2], newY = rawDst[i * 2 + 1];
-                                if (!H.empty() && ransacMask.data[i] === 1) {
-                                    goodNewPts.push(new cv.Point(newX, newY));
+                                if (ok && ransacMask.data[i] === 1) {
+                                    goodNewPts.push(newX, newY);
                                     dxSum += (oldX - newX); dySum += (newY - oldY);
                                     inlierCount++;
                                     cv.circle(newFrame, new cv.Point(newX, newY), 3, colorGreen, -1);
@@ -700,12 +847,11 @@
                                     cv.circle(newFrame, new cv.Point(newX, newY), 4, colorRed, 2);
                                 }
                             }
-                            srcMat.delete(); dstMat.delete(); H.delete(); ransacMask.delete();
                         } else {
                             for (let i = 0; i < numPoints; i++) {
                                 let oldX = rawSrc[i * 2], oldY = rawSrc[i * 2 + 1];
                                 let newX = rawDst[i * 2], newY = rawDst[i * 2 + 1];
-                                goodNewPts.push(new cv.Point(newX, newY));
+                                goodNewPts.push(newX, newY);
                                 dxSum += (oldX - newX); dySum += (newY - oldY);
                                 inlierCount++;
                                 cv.circle(newFrame, new cv.Point(newX, newY), 3, colorGreen, -1);
@@ -717,31 +863,40 @@
                             let avgPxShiftY = dySum / inlierCount;
                             let zoomSlider = $('zoomSlider');
                             let currentZoom = parseFloat(zoomSlider ? zoomSlider.value : 1.0) || 1.0;
-                            let maxDimension = Math.max(video.width, video.height);
-                            let f_px_base = (maxDimension / 2) / Math.tan((baseLongEdgeFOV / 2) * (Math.PI / 180));
-                            let f_px = f_px_base * currentZoom;
+                            let maxDimension = Math.max(w, h);
+                            let f_px = ((maxDimension / 2) / Math.tan((baseLongEdgeFOV / 2) * (Math.PI / 180))) * currentZoom;
                             let degPerPixel = (180 / Math.PI) / f_px;
-                            optAzimuth += (avgPxShiftX * degPerPixel);
-                            optElevation += (avgPxShiftY * degPerPixel);
-                            optAzimuthVal.innerText = optAzimuth.toFixed(1) + "°";
-                            optElevationVal.innerText = optElevation.toFixed(1) + "°";
-                            overlayOpt.innerText = `Az: ${optAzimuth.toFixed(1)}° | El: ${optElevation.toFixed(1)}°`;
-                        }
-
-                        p0.delete();
-                        p0 = new cv.Mat(goodNewPts.length, 1, cv.CV_32FC2);
-                        for (let i = 0; i < goodNewPts.length; i++) {
-                            p0.data32F[i * 2] = goodNewPts[i].x;
-                            p0.data32F[i * 2 + 1] = goodNewPts[i].y;
+                            let dAz = avgPxShiftX * degPerPixel, dEl = avgPxShiftY * degPerPixel;
+                            // Ignore impossible jumps (bad frame), keep tracking
+                            if (isFinite(dAz) && isFinite(dEl) && Math.abs(dAz) < 15 && Math.abs(dEl) < 15) {
+                                optAzimuth += dAz;
+                                optElevation += dEl;
+                                optAzimuthVal.innerText = optAzimuth.toFixed(1) + "°";
+                                optElevationVal.innerText = optElevation.toFixed(1) + "°";
+                                overlayOpt.innerText = `Az: ${optAzimuth.toFixed(1)}° | El: ${optElevation.toFixed(1)}°`;
+                            }
                         }
                     }
 
+                    // Carry surviving points to the next frame
+                    p0.delete();
+                    p0 = goodNewPts.length
+                        ? cv.matFromArray(goodNewPts.length / 2, 1, cv.CV_32FC2, goodNewPts)
+                        : new cv.Mat();
+
                     cv.imshow('canvasOutput', newFrame);
                     newGray.copyTo(oldGray);
-                    if (maskMat != null && !maskMat.isDeleted()) maskMat.delete();
-                } catch (err) {
-                    console.error(err);
+                    consecutiveErrors = 0;
+                } catch (e) {
+                    console.error(e);
+                    // Never get stuck re-processing the same bad state: start fresh next frame
+                    resetTracking = true;
+                    if (++consecutiveErrors > 30) {
+                        consecutiveErrors = 0;
+                        restartCamera('Tracking error, restarting camera…');
+                    }
                 } finally {
+                    for (const m of tmp) { try { if (m && !m.isDeleted()) m.delete(); } catch (e) {} }
                     setTimeout(processVideo, 1000 / FPS);
                 }
             }
